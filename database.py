@@ -183,3 +183,4 @@ def remove_session_sas(user_id, date, clock_in):
     c.execute("DELETE FROM clock_times_sas WHERE user_id = ? AND date = ? AND clock_in = ?", (user_id, date, clock_in))
     conn.commit()
     conn.close()
+
