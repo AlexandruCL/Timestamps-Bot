@@ -70,6 +70,7 @@ CONDUCERE_ROLE_ID             = int(need("CONDUCERE_ROLE_ID"))
 SAS_CHANNEL_ID = int(need("SAS_CHANNEL_ID"))
 SAS_ACTIUNI_CHANNEL_ID = int(need("SAS_ACTIUNI_CHANNEL_ID"))
 SAS_ROLE_IDS = int(need("SAS_ROLE_IDS"))
+SHEIFF_ROLE_IDS = int(need("SHEIFF_ROLE_IDS"))
 SAS_COORDONATOR_IDS = int(need("SAS_COORDONATOR_IDS"))
 ACTIVITY_API_URL = os.getenv("ACTIVITY_API_URL")          
 ACTIVITY_API_TOKEN = os.getenv("ACTIVITY_API_TOKEN")     
@@ -93,6 +94,7 @@ if not SAS_COORDONATOR_IDS:
 DEV_GUILD_ID_ENV = os.getenv("DEV_GUILD_ID")
 DEV_GUILD_ID = int(DEV_GUILD_ID_ENV) if DEV_GUILD_ID_ENV and DEV_GUILD_ID_ENV.isdigit() else None
 LEAVE_CHANNEL_ID = int(need("LEAVE_CHANNEL_ID"))
+JOIN_CHANNEL_ID = int(need("JOIN_CHANNEL_ID"))
 
 EOD_CONFIRM_WINDOW_SECS = int(os.getenv("EOD_CONFIRM_WINDOW_SECS", "300"))  # 5 minutes
 EOD_CONFIRM_EMOJI = "✅"
@@ -376,6 +378,59 @@ def build_day_report(date_str: str, guild: discord.Guild, member: discord.Member
         lines = ["Fără date."]
     return title, lines
 
+def build_week_report_sheriff(guild: discord.Guild, week_dates: list[str]) -> list[str]:
+    """
+    Build weekly report for SAS members.
+    Returns lines containing the formatted table.
+    """
+    # Get all SAS members
+    members = []
+    for m in guild.members:
+        if not m.bot and has_role(m, SHEIFF_ROLE_IDS):
+            members.append(m)
+    
+    # Sort by callsign
+    members = sorted(members, key=lambda m: _callsign_sort_key(m, is_sas=True))
+    
+    # Build table header
+    day_names = ["Du", "Lu", "Ma", "Mi", "Jo", "Vi", "Sb"]
+    header = f"{'Nume':<25} " + " ".join(f"{d:>6}" for d in day_names) + "  Total"
+    lines = [header, "-" * len(header)]
+    
+    # Build rows for ALL members
+    for mem in members:
+        # Use display name instead of callsign
+        display_name = (mem.display_name or mem.name or "Unknown")[:25]  # Limit to 25 chars
+        
+        # Calculate minutes for each day
+        day_minutes = []
+        total = 0
+        
+        for date_str in week_dates:
+            sessions = get_clock_times(mem.id, date_str)
+            day_total = 0
+            
+            for s in sessions:
+                if s[0] and s[1]:
+                    ci = parse_local(date_str, s[0])
+                    co = parse_local(date_str, s[1])
+                    mins = (co - ci).total_seconds() / 60
+                    r = round_minutes(mins)
+                    if r > 0:
+                        day_total += r
+            
+            day_minutes.append(day_total)
+            total += day_total
+        
+        # Include ALL members (even with 0 total)
+        day_str = " ".join(f"{int(m):>6}" for m in day_minutes)
+        row = f"{display_name:<25} {day_str}  {int(total):>5}"
+        lines.append(row)
+    
+    if len(lines) == 2:  # Only header + separator (no members with SAS role)
+        lines.append("Niciun membru Sheriff găsit.")
+    
+    return lines
 
 # --------------- Helpers (warn) ---------------
 
@@ -1207,7 +1262,7 @@ class HrButtons(discord.ui.View):
                 ephemeral=True
             )
             return
-        view = OngoingStopView(sessions, interaction.user.id, today, is_sas=False)
+        view = OngoingStopView(sessions, interaction.user.id, today, guild_id=interaction.guild.id, is_sas=False)
         await interaction.response.send_message(
             embed=make_embed("Opreste Pontaje", f"Sesiuni active azi ({len(sessions)}). Apasă Stop pentru a elimina.", discord.Color.orange(), interaction.user),
             view=view,
@@ -1280,6 +1335,12 @@ class HrButtons(discord.ui.View):
     
     @discord.ui.button(label="Adaugă Minute", style=discord.ButtonStyle.grey, custom_id="add_minutes_btn")
     async def add_minutes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id == 808416790471770192:
+            await interaction.response.send_message(
+                embed=make_embed("Acces Interzis", "Acțiunea este restricționată pentru tine. Ia la muie mateiu <3. Dai mesaj la regele tau da?", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
         # Channel + perms
         if not interaction.channel or interaction.channel.id != ALLOWED_CHANNEL_ID:
             await interaction.response.send_message(
@@ -1306,6 +1367,12 @@ class HrButtons(discord.ui.View):
     
     @discord.ui.button(label="Șterge Pontaj", style=discord.ButtonStyle.grey, custom_id="rmv_panel_btn")
     async def rmv_panel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id == 808416790471770192:
+            await interaction.response.send_message(
+                embed=make_embed("Acces Interzis", "Acțiunea este restricționată pentru tine. Ia la muie mateiu <3. Dai mesaj la regele tau da?", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
         # Channel + perms
         if not interaction.channel or interaction.channel.id != ALLOWED_CHANNEL_ID:
             await interaction.response.send_message(
@@ -1329,7 +1396,108 @@ class HrButtons(discord.ui.View):
             await log_command(interaction, "stergepontaj-panel-open", changed=False)
         except Exception:
             pass
+    
+    @discord.ui.button(label="Pontaje / Săptămânale Sheriff", style=discord.ButtonStyle.grey, custom_id="week_report_sheriff_btn")
+    async def week_report_sheriff_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_basic(interaction):
+            return
+        
+        # Show week selection view instead of generating report immediately
+        view = WeekSelectionViewSheriff(interaction.user.id)
+        await interaction.response.send_message(
+            embed=make_embed(
+                "Selectează Săptămâna",
+                "Alege săptămâna pentru raport:",
+                discord.Color.blurple(),
+                interaction.user
+            ),
+            view=view,
+            ephemeral=True
+        )
 
+class WeekSelectionViewSheriff(discord.ui.View):
+    """View to select current or previous week for weekly report."""
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=180)
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Nu este sesiunea ta.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Săptămâna Curentă", style=discord.ButtonStyle.primary, custom_id="current_week_btn")
+    async def current_week_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._generate_week_report_sheriff(interaction, weeks_ago=0)
+
+    @discord.ui.button(label="Săptămâna Trecută", style=discord.ButtonStyle.secondary, custom_id="previous_week_btn")
+    async def previous_week_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._generate_week_report_sheriff(interaction, weeks_ago=1)
+
+    async def _generate_week_report_sheriff(self, interaction: discord.Interaction, weeks_ago: int):
+        # Defer response as this might take time
+        await interaction.response.defer(ephemeral=True)
+        
+        # Calculate the reference date
+        reference_date = local_now() - datetime.timedelta(weeks=weeks_ago)
+        
+        week_label, week_dates = _get_week_dates(reference_date)
+        lines = build_week_report_sheriff(interaction.guild, week_dates)
+        
+        # Create well-formatted .txt file content
+        report_lines = []
+        
+        # Add header with title and date range
+        report_lines.append("=" * 80)
+        report_lines.append(f"RAPORT SĂPTĂMÂNAL Sheriff - {week_label}".center(80))
+        report_lines.append("=" * 80)
+        report_lines.append("")
+        
+        # Add the table (already formatted from build_week_report_sas)
+        report_lines.extend(lines)
+        
+        # Add footer with generation info
+        report_lines.append("")
+        report_lines.append("-" * 80)
+        report_lines.append(f"Generat la: {local_now().strftime('%d/%m/%Y %H:%M:%S')}")
+        report_lines.append(f"Generat de: {interaction.user.display_name}")
+        report_lines.append(f"Total membri: {len(lines) - 2}")  # Exclude header + separator
+        report_lines.append("=" * 80)
+        
+        report_text = "\n".join(report_lines)
+        
+        # Create file buffer with UTF-8 encoding (with BOM for better Windows compatibility)
+        file_buffer = io.BytesIO(report_text.encode('utf-8-sig'))
+        file_buffer.seek(0)
+        
+        # Create Discord file
+        filename = f"Raport_Sheriff_{week_label.replace(' ', '_').replace('.', '_')}.txt"
+        discord_file = discord.File(file_buffer, filename=filename)
+        
+        # Send file
+        await interaction.followup.send(
+            embed=make_embed(
+                f"📊 Raport Săptămânal Sheriff - {week_label}",
+                f"**Raport generat pentru {len(lines) - 2} membri.**\n\n"
+                f"Descarcă fișierul `.txt` de mai jos pentru a vizualiza raportul formatat.\n"
+                f"📁 Poate fi deschis în Notepad, Excel, sau orice editor de text.",
+                discord.Color.green(),
+                interaction.user
+            ),
+            file=discord_file,
+            ephemeral=True
+        )
+        
+        try:
+            await log_command(
+                interaction,
+                "week-report-sheriff",
+                changed=False,
+                extra=f"week={week_label} weeks_ago={weeks_ago} format=txt members={len(lines)-2}"
+            )
+        except Exception:
+            pass
 class SASClockButtons(discord.ui.View):
     """Persistent SAS clock buttons."""
     def __init__(self):
@@ -1530,7 +1698,7 @@ class SASCoordonatorButtons(discord.ui.View):
                 ephemeral=True
             )
             return
-        view = OngoingStopView(sessions, interaction.user.id, today, is_sas=True)
+        view = OngoingStopView(sessions, interaction.user.id, today, guild_id=interaction.guild.id, is_sas=True)
         await interaction.response.send_message(
             embed=make_embed("Opreste Pontaje", f"Sesiuni active azi ({len(sessions)}). Apasă Stop pentru a elimina.", discord.Color.orange(), interaction.user),
             view=view,
@@ -1577,6 +1745,12 @@ class SASCoordonatorButtons(discord.ui.View):
 
     @discord.ui.button(label="Adaugă Minute", style=discord.ButtonStyle.grey, custom_id="add_minutes_sas_btn")
     async def add_minutes_sas_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id == 808416790471770192:
+            await interaction.response.send_message(
+                embed=make_embed("Acces Interzis", "Acțiunea este restricționată pentru tine. Ia la muie mateiu <3. Dai mesaj la regele tau da?", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
         # Channel + perms
         if not interaction.channel or interaction.channel.id != SAS_CHANNEL_ID:
             await interaction.response.send_message(
@@ -1603,6 +1777,12 @@ class SASCoordonatorButtons(discord.ui.View):
 
     @discord.ui.button(label="Pontaje / Săptămânale", style=discord.ButtonStyle.grey, custom_id="week_report_sas_btn")
     async def week_report_sas_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id == 808416790471770192:
+            await interaction.response.send_message(
+                embed=make_embed("Acces Interzis", "Acțiunea este restricționată pentru tine. Ia la muie mateiu <3. Dai mesaj la regele tau da?", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
         if not await self._check_basic(interaction):
             return
         if not is_csas(interaction.user):
@@ -2637,12 +2817,13 @@ class OngoingStopView(discord.ui.View):
     """
     PAGE_SIZE = 4
 
-    def __init__(self, sessions: list[tuple[int, str, str]], requester_id: int, day: str, *, is_sas: bool = False):
+    def __init__(self, sessions: list[tuple[int, str, str]], requester_id: int, day: str, *, guild_id: int | None = None, is_sas: bool = False):
         super().__init__(timeout=180)
         self.sessions = sessions          # (uid, date, ci)
         self.requester_id = requester_id
         self.day = day
         self.page_index = 0
+        self.guild_id = guild_id
         self.is_sas = is_sas
         self.rebuild()
 
@@ -2661,12 +2842,15 @@ class OngoingStopView(discord.ui.View):
         for row, (uid, date_val, ci) in enumerate(slice_sessions):
             member = None
             try:
-                # first guild assumption (adjust if multi-guild)
-                if bot.guilds:
-                    member = bot.guilds[0].get_member(uid)
+                guild = bot.get_guild(self.guild_id) if self.guild_id else (bot.guilds[0] if bot.guilds else None)
+                if guild:
+                    member = guild.get_member(uid)
             except Exception:
                 pass
-            name = member.display_name if member else str(uid)
+            if member:
+                name = member.nick if member.nick else member.name
+            else:
+                name = str(uid)
             self.add_item(StopSessionButton(self, row=row, idx=start + row + 1, user_id=uid, start_time=ci, display_name=name))
 
         # Navigation if multiple pages
@@ -3615,6 +3799,12 @@ async def on_member_remove(member: discord.Member):
         logging.exception("Failed to send leave message")
     # Minimal file log
     _append_log_line(f"[{datetime.datetime.utcnow().isoformat()}Z] [LEAVE] {msg}")
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    channel = member.guild.get_channel(JOIN_CHANNEL_ID)
+    if isinstance(channel, discord.TextChannel):
+        await channel.send(f"Welcome {member.mention}!")
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
