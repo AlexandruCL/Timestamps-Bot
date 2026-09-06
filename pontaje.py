@@ -1338,12 +1338,6 @@ class HrButtons(discord.ui.View):
     
     @discord.ui.button(label="Adaugă Minute", style=discord.ButtonStyle.grey, custom_id="add_minutes_btn")
     async def add_minutes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id == 808416790471770192:
-            await interaction.response.send_message(
-                embed=make_embed("Acces Interzis", "Acțiunea este restricționată pentru tine. Ia la muie mateiu <3. Dai mesaj la regele tau da?", discord.Color.red(), interaction.user),
-                ephemeral=True
-            )
-            return
         # Channel + perms
         if not interaction.channel or interaction.channel.id != ALLOWED_CHANNEL_ID:
             await interaction.response.send_message(
@@ -1370,12 +1364,6 @@ class HrButtons(discord.ui.View):
     
     @discord.ui.button(label="Șterge Pontaj", style=discord.ButtonStyle.grey, custom_id="rmv_panel_btn")
     async def rmv_panel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id == 808416790471770192:
-            await interaction.response.send_message(
-                embed=make_embed("Acces Interzis", "Acțiunea este restricționată pentru tine. Ia la muie mateiu <3. Dai mesaj la regele tau da?", discord.Color.red(), interaction.user),
-                ephemeral=True
-            )
-            return
         # Channel + perms
         if not interaction.channel or interaction.channel.id != ALLOWED_CHANNEL_ID:
             await interaction.response.send_message(
@@ -1748,12 +1736,6 @@ class SASCoordonatorButtons(discord.ui.View):
 
     @discord.ui.button(label="Adaugă Minute", style=discord.ButtonStyle.grey, custom_id="add_minutes_sas_btn")
     async def add_minutes_sas_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id == 808416790471770192:
-            await interaction.response.send_message(
-                embed=make_embed("Acces Interzis", "Acțiunea este restricționată pentru tine. Ia la muie mateiu <3. Dai mesaj la regele tau da?", discord.Color.red(), interaction.user),
-                ephemeral=True
-            )
-            return
         # Channel + perms
         if not interaction.channel or interaction.channel.id != SAS_CHANNEL_ID:
             await interaction.response.send_message(
@@ -1780,12 +1762,6 @@ class SASCoordonatorButtons(discord.ui.View):
 
     @discord.ui.button(label="Pontaje / Săptămânale", style=discord.ButtonStyle.grey, custom_id="week_report_sas_btn")
     async def week_report_sas_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id == 808416790471770192:
-            await interaction.response.send_message(
-                embed=make_embed("Acces Interzis", "Acțiunea este restricționată pentru tine. Ia la muie mateiu <3. Dai mesaj la regele tau da?", discord.Color.red(), interaction.user),
-                ephemeral=True
-            )
-            return
         if not await self._check_basic(interaction):
             return
         if not is_csas(interaction.user):
