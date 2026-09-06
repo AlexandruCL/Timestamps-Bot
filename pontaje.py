@@ -74,7 +74,10 @@ SHEIFF_ROLE_IDS = int(need("SHEIFF_ROLE_IDS"))
 SAS_COORDONATOR_IDS = int(need("SAS_COORDONATOR_IDS"))
 ACTIVITY_API_URL = os.getenv("ACTIVITY_API_URL")          
 ACTIVITY_API_TOKEN = os.getenv("ACTIVITY_API_TOKEN")     
-ACTIVITY_API_SHEET = os.getenv("ACTIVITY_API_SHEET", "RAZII")  
+ACTIVITY_API_SHEET = os.getenv("ACTIVITY_API_SHEET", "RAZII")
+
+PONTAJE_API_PORT = int(os.getenv("PONTAJE_API_PORT", "3080"))
+PONTAJE_API_TOKEN = os.getenv("PONTAJE_API_TOKEN", "")  
 
 CALLSIGN_RE = re.compile(r"\[?S-(\d{1,2})\]?", re.IGNORECASE)
 PD_CALLSIGN_RE = re.compile(r"\[(\d{1,3})\]")  
@@ -3499,6 +3502,14 @@ class Bot(commands.Bot):
             self.auto_close_today_sessions.start()
         except RuntimeError:
             pass
+
+        # Start the Pontaje HTTP API server
+        if PONTAJE_API_TOKEN:
+            try:
+                await _start_pontaje_api(self)
+                logging.info(f"Pontaje API started on port {PONTAJE_API_PORT}")
+            except Exception:
+                logging.exception("Failed to start Pontaje API server")
         if self._console_task is None:
             self._console_task = self.loop.create_task(self._console_relay())
     
@@ -4333,6 +4344,96 @@ async def db_stats_command(ctx: commands.Context):
         await ctx.reply(f"DB Stats:\n{db_stats_text}", mention_author=False)
     except Exception as e:
         await ctx.reply(f"Eroare: {e}", mention_author=False)
+# --------------- Pontaje HTTP API ---------------
+from aiohttp import web as aiohttp_web
+
+async def _handle_pontaje_request(request: aiohttp_web.Request) -> aiohttp_web.Response:
+    """Handle GET /api/pontaje?discord_id=<id>&date=<YYYY-MM-DD>"""
+    # Auth check
+    auth_header = request.headers.get("Authorization", "")
+    expected = f"Bearer {PONTAJE_API_TOKEN}"
+    if auth_header != expected:
+        return aiohttp_web.json_response({"error": "Unauthorized"}, status=401)
+
+    # Parse params
+    discord_id_raw = request.query.get("discord_id")
+    date_str = request.query.get("date")
+
+    if not discord_id_raw or not date_str:
+        return aiohttp_web.json_response(
+            {"error": "Missing required query params: discord_id, date"},
+            status=400
+        )
+
+    try:
+        discord_id = int(discord_id_raw)
+    except ValueError:
+        return aiohttp_web.json_response({"error": "discord_id must be an integer"}, status=400)
+
+    # Validate date format
+    try:
+        datetime.datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return aiohttp_web.json_response({"error": "date must be in YYYY-MM-DD format"}, status=400)
+
+    # Query PD pontaje from database
+    sessions = get_clock_times(discord_id, date_str)
+
+    session_list = []
+    total_minutes = 0
+
+    for s in sessions:
+        ci_s, co_s = s[0], s[1]
+        if ci_s and co_s:
+            ci = parse_local(date_str, ci_s)
+            co = parse_local(date_str, co_s)
+            mins = (co - ci).total_seconds() / 60
+            r = round_minutes(mins)
+            if r > 0:
+                total_minutes += r
+            session_list.append({
+                "clock_in": ci_s,
+                "clock_out": co_s,
+                "minutes": int(r)
+            })
+        elif ci_s and not co_s:
+            # Ongoing session
+            now = local_now()
+            ci = parse_local(date_str, ci_s)
+            mins = (now - ci).total_seconds() / 60 if now.strftime("%Y-%m-%d") == date_str else 0
+            r = max(0, round_minutes(mins))
+            if r > 0:
+                total_minutes += r
+            session_list.append({
+                "clock_in": ci_s,
+                "clock_out": None,
+                "minutes": int(r),
+                "ongoing": True
+            })
+
+    return aiohttp_web.json_response({
+        "discord_id": discord_id,
+        "date": date_str,
+        "sessions": session_list,
+        "total_minutes": int(total_minutes)
+    })
+
+async def _handle_health(request: aiohttp_web.Request) -> aiohttp_web.Response:
+    """Health check endpoint."""
+    return aiohttp_web.json_response({"status": "ok"})
+
+async def _start_pontaje_api(bot_instance):
+    """Start the aiohttp web server for the Pontaje API."""
+    app = aiohttp_web.Application()
+    app.router.add_get("/api/pontaje", _handle_pontaje_request)
+    app.router.add_get("/health", _handle_health)
+
+    runner = aiohttp_web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp_web.TCPSite(runner, "0.0.0.0", PONTAJE_API_PORT)
+    await site.start()
+    logging.info(f"Pontaje API listening on 0.0.0.0:{PONTAJE_API_PORT}")
+
 # --------------- Run ---------------
 if __name__ == "__main__":
     if not TOKEN:
