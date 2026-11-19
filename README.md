@@ -1,204 +1,150 @@
-# 🤖 Bot Pontaje - Discord Time Tracking System
+# Bot Pontaje: Discord Time Tracking
 
-A comprehensive Discord bot for managing time tracking, attendance, and reporting for organizations with multiple departments (Police Department, Human Resources, and SAS).
+A Discord bot that tracks shift time (pontaje) for a Police Department (PD) roster. Members clock in and out from a button panel, HR and leadership (Conducere) manage sessions and warns from a second panel, and finished days are written to a Google Sheet.
 
-## 📋 Features
+The bot's interface is in Romanian.
 
-### ⏰ Time Tracking System
-- **Clock In/Out**: Members can clock in and out of their shifts with a single button
-- **Automatic EOD Handling**: End-of-day confirmations at 23:55 with automatic session closure
-- **Break Management**: Track breaks and pauses during shifts
-- **Multi-department Support**: Separate tracking for PD, HR, and SAS roles
+## Features
 
-### 📊 Reporting & Analytics
-- **Daily Reports**: View individual member attendance for specific dates
-- **Weekly Reports**: Generate comprehensive weekly summaries (Sunday-Saturday)
-  - Exportable as formatted `.txt` files
-  - Shows daily breakdown and weekly totals
-  - Automatic member sorting by callsign
-- **Google Sheets Integration**: Sync attendance data to Google Sheets for advanced reporting
-- **Historical Data**: Access past records with date range selection
+### Clock panel (PD members)
 
-### 👥 Role-Based Access Control
-- **Police Department (PD)**: Standard time tracking
-- **Human Resources (HR)**: Administrative oversight and reporting
-- **SAS Coordinator**: Specialized team management and weekly reports
-- **Department-specific Permissions**: Hierarchical access to features
+- **Clock IN / Clock OUT** buttons. One open session per member per day.
+- **Pontajele Mele** shows your sessions for a day, the day total against the daily target, and the Sunday to Saturday week total against the weekly target. Arrows move between days.
+- Minutes are rounded to the nearest 5 per session.
+- The buttons are locked from 23:55 to 00:00 and from 05:25 to 05:30 while end-of-day prompts run.
 
-### 🔔 Notifications & Reminders
-- **EOD Confirmations**: Automated end-of-day session prompts
-- **Session Warnings**: Alerts for extended shifts
-- **Activity Logging**: Comprehensive audit trail of all actions
+### End-of-day confirmation
 
-## 🚀 Setup
+- At 23:55 every session still open gets a prompt (DM, or a fallback channel if DMs are closed) proposing an end time of 23:59:59.
+- At 05:25 night-shift sessions get the same prompt with an end time of 05:30:00.
+- The member has `EOD_CONFIRM_WINDOW_SECS` (5 minutes by default) to press **Confirm pontaj**. Unconfirmed sessions are not saved. Confirmed and unconfirmed results are logged to separate channels.
 
-### Prerequisites
-- Python 3.9+
-- Discord Bot Token
-- Google Sheets API credentials (for reporting features)
+### HR panel (HR and Conducere roles)
 
-### Installation
+- **Pontaje Deschise**: today's open sessions, with a Stop button per member (asks for confirmation, then deletes the session).
+- **Warn**: pick a member, add a warn with a reason or reset their count. Each warn is posted in the warn channel; the third one also pings HR and Conducere. Counts are stored in `punishments.db`.
+- **Pontaje / ZI**: day report for all PD members (sorted by callsign) or for one member with per-session detail. Opens on yesterday, with day arrows and a month calendar picker for older days.
+- **Adaugă Minute**: add minutes to a member on a given date.
+- **Șterge Pontaj**: delete one of a member's sessions from the last 7 days, or from a date you type.
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/AlexandruCL/BotPontajeProject.git
-   cd BotPontajeProject
-   ```
+### Google Sheets export
 
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+Users listed in `SHEET_EXPORT_USER_IDS` see two extra buttons on the day report:
 
-3. **Configure environment variables**
-   
-   Create a `.env` file in the project root:
-   ```env
-   DISCORD_TOKEN=your_discord_bot_token_here
-   GUILD_ID=your_guild_id_here
-   ```
+- **Trimite în Sheet** writes the viewed day into the weekday column (F to L, Monday to Sunday) of the `Monitorizare Activitate` tab. Each row with a callsign and a name gets that member's minutes, or 0.
+- **Trimite Săptămâna** does the same for every finished day of the viewed Sunday to Saturday week.
+- Members on leave (`Concedii` tab of the PD spreadsheet) get `CO`. Existing `CO` cells are never overwritten.
+- Members hired that day (`DATA ANGAJARE` in `Evidenta membrii`) who are under the daily target get `/`.
+- The bot remembers which days were sent, by whom and when. Sending a day again asks for confirmation first.
+- The reply lists callsigns missing from the sheet, members without a `[callsign]` in their nickname, and who got `/`.
+- Every 30 minutes the bot copies the current week's leave from `Concedii` into the sheet as `CO` (skipped on Sundays, before the new week is sent).
 
-4. **Set up Google Sheets credentials**
-   
-   - Create a service account in Google Cloud Console
-   - Download the credentials JSON file
-   - Save it as `credentials.json` in the project root
-   - Enable Google Sheets API and Google Drive API
+### Reminders and logging
 
-5. **Configure database**
-   
-   The bot uses SQLite by default. The database will be created automatically on first run.
+- Every Thursday at 15:00, PD members who clocked in this week but are under `WEEKLY_TARGET_MINUTES` get a DM with their total and how many minutes they still need.
+- Every action is logged to `LOGS_CHANNEL_ID` and `logs.txt`. Added minutes, stopped sessions and deleted sessions are also copied to their own channels.
 
-### Running the Bot
+### HTTP API
+
+When `PONTAJE_API_TOKEN` is set, the bot serves a small API on `PONTAJE_API_PORT` so other bots can read sessions:
+
+```
+GET /api/pontaje?discord_id=<id>&date=<YYYY-MM-DD>
+Authorization: Bearer <PONTAJE_API_TOKEN>
+```
+
+```json
+{
+  "discord_id": 123,
+  "date": "2026-11-18",
+  "sessions": [{"clock_in": "18:02:11", "clock_out": "20:15:40", "minutes": 135}],
+  "total_minutes": 135
+}
+```
+
+An open session has `"ongoing": true` and counts up to now. `GET /health` returns `{"status": "ok"}`.
+
+### Commands
+
+| Command | Who | What |
+|---|---|---|
+| `/clockpanel` | Owner, in the panel channel | Posts the clock panel |
+| `/hrpanel` | Owner, in the panel channel | Posts the HR panel |
+| `@bot dbv` | Owner | WAL checkpoint and `VACUUM` on the database |
+| `@bot dbs` | Owner | Database size and free space |
+
+The panels are persistent: their buttons keep working after a restart.
+
+## Setup
+
+Requires Python 3.10+ and SQLite 3.24+.
 
 ```bash
-python bot2.py
+pip install discord.py python-dotenv gspread
 ```
 
-## 📖 Usage
+Create a `.env` file:
 
-### For Members
+```env
+BOT_TOKEN=
+ALLOWED_CHANNEL_ID=            # channel holding both panels
+ALLOWED_PUNISH_CHANNEL_ID=     # warns are posted here
+LOGS_CHANNEL_ID=
+REQUIRED_PD_ROLE_NAME=         # comma-separated PD role ids
+REQUIRED_HR_ROLE_NAME=         # HR role id
+CONDUCERE_ROLE_ID=
 
-**Clocking In/Out:**
-1. Navigate to your department's channel
-2. Click the "Clock In" button
-3. When your shift ends, click "Clock Out"
-4. Confirm or dismiss the End-of-Day prompt at 23:55
-
-**Viewing Your Time:**
-- Use the "Raport Pontaj / Zilnic" button to see your daily hours
-- Select the date you want to view
-
-### For Coordinators
-
-**Weekly Reports (SAS):**
-1. Click "Pontaje / Săptămânale" button
-2. Choose "Săptămâna Curentă" or "Săptămâna Trecută"
-3. Download the generated `.txt` report
-
-**Report Format:**
-```
-Nume                       Du     Lu     Ma     Mi     Jo     Vi     Sb  Total
---------------------------------------------------------------------------------
-[S-01] John Doe          120    180     90      0    150    200    100    840
-[S-02] Jane Smith          0     60    120    180     90      0    150    600
-```
-
-### For Administrators
-
-**HR Functions:**
-- View all member attendance
-- Generate department-wide reports
-- Access Google Sheets sync features
-- Manage historical records
-
-## 🗂️ Project Structure
-
-```
-BotPontajeProject/
-├── bot2.py              # Main bot file with Discord commands
-├── database.py          # Database operations and queries
-├── tickete.py           # Ticketing system (if applicable)
-├── credentials.json     # Google Sheets API credentials (not in git)
-├── .env                 # Environment variables (not in git)
-├── requirements.txt     # Python dependencies
-├── logs.txt            # Application logs
-└── README.md           # This file
+# optional
+ADDMINUTES_LOG_CHANNEL_ID=     # comma-separated extra log channels
+ONGOING_STOP_CHANNEL_ID=
+DELETE_PONTAJ_CHANNEL_ID=
+SHEET_EXPORT_USER_IDS=         # comma-separated user ids allowed to send to the sheet
+GOOGLE_SHEETS_CREDENTIALS_FILE=credentials.json
+PONTAJE_SHEET_ID=
+PD_SPREADSHEET_ID=
+PONTAJE_API_TOKEN=             # API is off when empty
+PONTAJE_API_PORT=3080
+DEV_GUILD_ID=                  # sync slash commands to one guild only
+EOD_CONFIRM_WINDOW_SECS=300
+WEEKLY_TARGET_MINUTES=700
+DAILY_TARGET_MINUTES=100
+TIMEZONE=Europe/Bucharest
 ```
 
-## 🔧 Configuration
+The owner id and the end-of-day channel ids are constants at the top of `pontaje.py`.
 
-### Role IDs
-Update the role IDs in `bot2.py` to match your Discord server:
+For the sheet export, create a Google service account, save its key as `credentials.json`, and share both spreadsheets with the service account's email.
 
-```python
-PD_ROLE_IDS = [123456789, ...]  # Police Department roles
-HR_ROLE_IDS = [123456789, ...]  # Human Resources roles
-SAS_ROLE_IDS = [123456789, ...] # SAS roles
+Run:
+
+```bash
+python pontaje.py
 ```
 
-### Time Zone
-The bot uses Romania timezone (`Europe/Bucharest`) by default. Modify in `bot2.py`:
+## Files
 
-```python
-TZ = ZoneInfo("Europe/Bucharest")
+```
+pontaje.py    the bot: panels, views, scheduled tasks, Sheets export, HTTP API
+database.py   SQLite access (clock_times.db, punishments.db)
 ```
 
-## 📝 Database Schema
+### Database
 
-The bot uses SQLite with the following key tables:
-- **clock_sessions**: Stores clock in/out records
-- **eod_confirmations**: Tracks end-of-day confirmations
-- **activity_logs**: Audit trail of all actions
+`clock_times.db` (WAL mode):
 
-## 🔒 Security Notes
+- `clock_times(user_id, date, clock_in, clock_out)`: one row per session, `clock_out` is NULL while open.
+- `sheet_exports(date, user_id, sent_at)`: last time each day was sent to the sheet.
 
-- ✅ `credentials.json` is gitignored (never commit to version control)
-- ✅ `.env` file is gitignored (keep tokens secure)
-- ✅ Private repository recommended for production use
-- ✅ Service account permissions should be minimal (read/write to specific sheets only)
+`punishments.db`:
 
-## 🐛 Troubleshooting
+- `punishments(user_id, count)`: warn count per member.
 
-**Bot not responding:**
-- Check Discord token in `.env`
-- Verify bot has necessary permissions in your server
-- Check `logs.txt` for error messages
+## License
 
-**Google Sheets errors:**
-- Verify `credentials.json` is in the project root
-- Ensure Google Sheets API is enabled
-- Check service account has access to target sheets
+Proprietary, showcase only. See [LICENSE](LICENSE). Viewing is allowed; any other use needs the owner's written permission.
 
-**Time tracking issues:**
-- Confirm user has the appropriate role
-- Check database permissions
-- Verify timezone settings match your location
+Also see the [Privacy Policy](Privacy-Policy.md) and [Terms of Service](TermsOfService.md).
 
-## 🤝 Contributing
+## Author
 
-Contributions are welcome! Please follow these steps:
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-## 📄 License
-
-See license in repository.
-
-## 👤 Author
-
-**Alexandru CL**
-- GitHub: [@AlexandruCL](https://github.com/AlexandruCL)
-
-## 🙏 Acknowledgments
-
-- Discord.py community
-- gspread library for Google Sheets integration
-- All contributors and testers
-
----
-
-**Note:** This bot is designed for internal organizational use. Ensure compliance with your organization's data policies and Discord's Terms of Service.
+Cristea Laur-Alexandru ([@AlexandruCL](https://github.com/AlexandruCL))
