@@ -30,6 +30,11 @@ def init_db():
     conn.close()
     _exec("CREATE TABLE IF NOT EXISTS punishments (user_id INTEGER PRIMARY KEY, count INTEGER)", db=PUNISH_DB_PATH)
     _exec("CREATE TABLE IF NOT EXISTS sheet_exports (date TEXT PRIMARY KEY, user_id INTEGER, sent_at INTEGER)")
+    _exec("""CREATE TABLE IF NOT EXISTS logs (
+             id INTEGER PRIMARY KEY AUTOINCREMENT, ts_utc TEXT, action TEXT, actor_id INTEGER, actor_name TEXT,
+             target_id INTEGER, target_name TEXT, extra TEXT, changed INTEGER, success INTEGER, source TEXT)""")
+    _exec("CREATE INDEX IF NOT EXISTS logs_ts ON logs (ts_utc)")
+    _exec("CREATE INDEX IF NOT EXISTS logs_action ON logs (action)")
 
 def get_sheet_export(date: str) -> tuple[int, int] | None:
     """(user_id, unix time) of the last time this day was sent to the pontaje sheet, or None."""
@@ -73,6 +78,13 @@ def update_clock_out(user_id, date, clock_out, start_time: str | None = None):
 def get_clock_times(user_id, date):
     return _exec("SELECT clock_in, clock_out FROM clock_times WHERE user_id = ? AND date = ? ORDER BY clock_in", (user_id, date))
 
+def get_clock_times_for_dates(dates: list[str]) -> list[tuple[int, str, str, str | None]]:
+    """(user_id, date, clock_in, clock_out) for every session on the given dates."""
+    if not dates:
+        return []
+    placeholders = ",".join("?" for _ in dates)
+    return _exec(f"SELECT user_id, date, clock_in, clock_out FROM clock_times WHERE date IN ({placeholders})", dates)
+
 def get_ongoing_sessions():
     return _exec("SELECT user_id, date, clock_in FROM clock_times WHERE clock_out IS NULL ORDER BY clock_in")
 
@@ -99,3 +111,32 @@ def increment_punish_count(user_id):
     _exec("INSERT INTO punishments (user_id, count) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET count = count + 1",
           (user_id,), PUNISH_DB_PATH)
     return get_punish_count(user_id)
+
+# ---------- Action log ----------
+LOG_COLUMNS = ("id", "ts_utc", "action", "actor_id", "actor_name", "target_id", "target_name", "extra", "changed", "success", "source")
+
+def insert_logs(rows: list[tuple]):
+    """rows: (ts_utc, action, actor_id, actor_name, target_id, target_name, extra, changed, success, source)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        conn.executemany(f"INSERT INTO logs ({', '.join(LOG_COLUMNS[1:])}) VALUES ({', '.join('?' * 10)})", rows)
+
+def query_logs(kind: str = "all", q: str = "", before_id: int | None = None, limit: int = 50) -> list[tuple]:
+    """Newest first. kind: all | changes | info | failures; q matches action, names and extra."""
+    where, params = [], []
+    if kind == "changes":
+        where.append("changed = 1")
+    elif kind == "info":
+        where.append("changed = 0")
+    elif kind == "failures":
+        where.append("success = 0")
+    if q:
+        like = "%" + q.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+        cols = ("action", "actor_name", "target_name", "extra", "CAST(actor_id AS TEXT)", "CAST(target_id AS TEXT)")
+        where.append("(" + " OR ".join(f"{c} LIKE ? ESCAPE '!'" for c in cols) + ")")
+        params += [like] * 6
+    if before_id is not None:
+        # by time, not id: rows imported from logs.txt get ids after rows the bot already wrote
+        where.append("(ts_utc, id) < (SELECT ts_utc, id FROM logs WHERE id = ?)")
+        params.append(before_id)
+    sql = f"SELECT {', '.join(LOG_COLUMNS)} FROM logs" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY ts_utc DESC, id DESC LIMIT ?"
+    return _exec(sql, (*params, limit))

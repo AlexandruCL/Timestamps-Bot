@@ -7,23 +7,30 @@ import re
 import pathlib
 import socket
 import sqlite3
+import sys
 from functools import partial
 from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiohttp import web as aiohttp_web
 import discord
-import gspread
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+
+sys.modules.setdefault("bot2", sys.modules[__name__])  # run as a script this module is __main__; services/web_api import it as bot2
+import services
 
 from database import (
     init_db, add_clock_in, update_clock_out, get_clock_times,
     get_ongoing_sessions, remove_session,
     increment_punish_count, get_punish_count, reset_punish_count,
     checkpoint_and_vacuum, db_stats, get_user_ids_for_dates,
-    get_sheet_export, mark_sheet_export,
+    get_sheet_export, mark_sheet_export, insert_logs,
+)
+from sheets import (
+    PONTAJE_SHEET_ID, PONTAJE_SHEET_TAB, PD_SPREADSHEET_ID, PD_MEMBERS_TAB,
+    sheets_client, concedii_on, update_pontaje_names,
 )
 
 # --------------- Environment ---------------
@@ -58,12 +65,6 @@ PONTAJE_API_TOKEN = os.getenv("PONTAJE_API_TOKEN", "")
 
 PD_CALLSIGN_RE = re.compile(r"\[(\d{1,3})\]")
 
-GOOGLE_SHEETS_CREDENTIALS_FILE = os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "credentials.json").strip()
-PONTAJE_SHEET_ID = os.getenv("PONTAJE_SHEET_ID", "").strip()
-PONTAJE_SHEET_TAB = "Monitorizare Activitate"
-PD_SPREADSHEET_ID = os.getenv("PD_SPREADSHEET_ID", "").strip()
-PD_MEMBERS_TAB = "Evidenta membrii"
-PD_LEAVE_TAB = "Concedii"
 SHEET_EXPORT_USER_IDS = id_list("SHEET_EXPORT_USER_IDS")  # Discord user ids allowed to use "Trimite în Sheet"
 
 DEV_GUILD_ID_ENV = os.getenv("DEV_GUILD_ID")
@@ -197,23 +198,36 @@ def _append_log_line(text: str):
     except Exception:
         pass
 
-async def log_command(
-    interaction: discord.Interaction,
+async def log_command(interaction: discord.Interaction, action: str, **kwargs):
+    await log_action(interaction.user, action, **kwargs)
+
+async def log_action(
+    actor: discord.abc.User,
     action: str,
     *,
     target: discord.abc.User | None = None,
     extra: str | None = None,
     changed: bool = False,
     success: bool = True,
+    source: str = "Discord",
 ):
-    """Write the action to logs.txt and the logs channel (plus EXTRA_LOG_CHANNELS). Never raises."""
+    """Write the action to logs.txt, the logs table and the logs channel (plus EXTRA_LOG_CHANNELS). Never raises."""
     try:
-        actor = interaction.user
         status = "SUCCESS" if success else "FAIL"
         kind = "MODIFY" if changed else "INFO"
         tgt_txt = f" | target={target}({target.id})" if target else ""
         extra_line = f" | {extra}" if extra else ""
-        _append_log_line(f"[{status}] [{kind}] {action} by {actor}({actor.id}){tgt_txt}{extra_line}")
+        src_txt = f" | source={source}" if source != "Discord" else ""
+        _append_log_line(f"[{status}] [{kind}] {action} by {actor}({actor.id}){tgt_txt}{extra_line}{src_txt}")
+        try:
+            insert_logs([(
+                datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                action, actor.id, getattr(actor, "display_name", str(actor)),
+                target.id if target else None, getattr(target, "display_name", str(target)) if target else None,
+                extra, int(changed), int(success), source,
+            )])
+        except sqlite3.Error:
+            logging.exception("logs table insert failed for %s", action)
 
         color = (
             discord.Color.green() if success and changed else
@@ -225,6 +239,7 @@ async def log_command(
             desc_parts.append(f"Target: {target.mention} (`{target.id}`)")
         desc_parts.append(f"Tip: {'Modificare' if changed else 'Informare'}")
         desc_parts.append(f"Status: {'Succes' if success else 'Eșec'}")
+        desc_parts.append(f"Sursă: {source}")
         if extra:
             desc_parts.append(f"Detalii: {extra[:500]}")
         embed = make_embed("Log Comandă", "\n".join(desc_parts), color, actor)
@@ -276,19 +291,24 @@ def _callsign_sort_key(member: discord.Member) -> tuple[int, str]:
     m = PD_CALLSIGN_RE.search(name) or re.search(r"\b(\d{1,3})\b", name)
     return (int(m.group(1)) if m else 10**6, name.lower())
 
-async def build_day_report(date_str: str, guild: discord.Guild, member: discord.Member | None = None) -> tuple[str, list[str]]:
+async def day_report_rows(date_str: str, guild: discord.Guild, member: discord.Member | None = None):
+    """(member, [(clock_in, clock_out, minutes)] closed sessions, total) for one member, or every PD member with minutes."""
     if member:
         members = [member]
     else:
         members = await fetch_members(guild, get_user_ids_for_dates([date_str]))
         members = sorted((m for m in members if has_any(m, REQUIRED_PD_ROLE_ID)), key=_callsign_sort_key)
-
-    lines = []
+    rows = []
     for mem in members:
         closed = [(ci, co, session_minutes(date_str, ci, co)) for ci, co in get_clock_times(mem.id, date_str) if ci and co]
         total = sum(mins for _, _, mins in closed)
-        if total <= 0:
-            continue
+        if total > 0:
+            rows.append((mem, closed, total))
+    return rows
+
+async def build_day_report(date_str: str, guild: discord.Guild, member: discord.Member | None = None) -> tuple[str, list[str]]:
+    lines = []
+    for mem, closed, total in await day_report_rows(date_str, guild, member):
         if member:
             details = [f"{idx}. {ci} - {co} ({mins}min)" for idx, (ci, co, mins) in enumerate(closed, start=1) if mins > 0]
             lines.append(f"{mem.display_name} Total: ({total})\n" + "\n".join(details))
@@ -302,42 +322,6 @@ def sheet_day_column(date_str: str) -> str:
     return "FGHIJKL"[datetime.date.fromisoformat(date_str).weekday()]
 
 assert [sheet_day_column(d) for d in ("2026-11-16", "2026-11-22")] == ["F", "L"]  # Monday, Sunday
-
-def sheets_client() -> gspread.Client:
-    # A week send is ~40 requests against Google's ~60 reads/minute; back off and retry instead of failing mid-week.
-    return gspread.service_account(filename=GOOGLE_SHEETS_CREDENTIALS_FILE, http_client=gspread.BackOffHTTPClient)
-
-def parse_sheet_date(text: str, year: int) -> datetime.date | None:
-    """Concedii dates are typed as dd.mm, dd/mm, dd.mm.yyyy or dd/mm/yyyy; a missing year means `year`."""
-    m = re.fullmatch(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{4}))?", text.strip())
-    if not m:
-        return None
-    try:
-        return datetime.date(int(m.group(3) or year), int(m.group(2)), int(m.group(1)))
-    except ValueError:
-        return None
-
-def concedii_on(gc: gspread.Client, dates: list[str]) -> dict[str, set[str]]:
-    """Callsign -> the given dates covered by one of its concedii (Concedii tab: D callsign, E start, F end, inclusive)."""
-    year = datetime.date.fromisoformat(dates[0]).year
-    out: dict[str, set[str]] = {}
-    for row in gc.open_by_key(PD_SPREADSHEET_ID).worksheet(PD_LEAVE_TAB).get("D:F"):
-        cs = row[0].strip() if row else ""
-        if len(row) < 3 or not cs.isdigit():
-            continue
-        start, end = parse_sheet_date(row[1], year), parse_sheet_date(row[2], year)
-        if not start or not end:
-            continue
-        if end < start and not re.search(r"\d{4}", row[2]):  # e.g. 28.12 -> 03.01
-            end = end.replace(year=end.year + 1)
-        covered = {d for d in dates if start.isoformat() <= d <= end.isoformat()}
-        if covered:
-            out.setdefault(cs.zfill(3), set()).update(covered)
-    return out
-
-assert parse_sheet_date("16.11", 2026) == datetime.date(2026, 11, 16)
-assert parse_sheet_date("21/11/2026", 2000) == datetime.date(2026, 11, 21)
-assert parse_sheet_date("CS indisponibil!", 2026) is None
 
 def sync_concedii_to_sheet() -> int:
     """Write CO for this Sunday-Saturday week's concedii into the pontaje sheet. Returns how many cells changed."""
@@ -414,9 +398,8 @@ def push_day_to_sheet(date_str: str, minutes_by_callsign: dict[str, int]) -> tup
         ws.batch_update(updates)
     return [cs for cs in minutes_by_callsign if cs not in found], slashed
 
-async def _post_warn(interaction: discord.Interaction, target: discord.abc.User, title: str, body: str, color: discord.Color, *, ping_mgmt: bool = False):
+async def post_warn(guild: discord.Guild, actor: discord.abc.User, target: discord.abc.User, title: str, body: str, color: discord.Color, *, ping_mgmt: bool = False):
     """Public warn message in the punish channel; ping_mgmt tags Conducere + HR (used at 3/3)."""
-    guild = interaction.guild
     ch = guild.get_channel(ALLOWED_PUNISH_CHANNEL_ID) if guild else None
     if not isinstance(ch, discord.TextChannel):
         return
@@ -425,7 +408,7 @@ async def _post_warn(interaction: discord.Interaction, target: discord.abc.User,
         roles = [r.mention for r in (guild.get_role(CONDUCERE_ROLE_ID), guild.get_role(REQUIRED_HR_ROLE_ID)) if r]
         content = "||" + " ".join(roles) + "||" if roles else None
     try:
-        await ch.send(content=content, embed=make_embed(title, f"{target.mention}\n{body}", color, interaction.user))
+        await ch.send(content=content, embed=make_embed(title, f"{target.mention}\n{body}", color, actor))
     except Exception:
         logging.exception("Warn post failed")
 
@@ -583,27 +566,21 @@ class DayReportView(OwnedView):
         await self._push_to_sheet(interaction, dates)
 
     async def _push_to_sheet(self, interaction: discord.Interaction, dates: list[str]):
-        parts, ok = [], True
-        for date_str in dates:
-            minutes, no_callsign = await day_minutes_by_callsign(date_str, interaction.guild)
-            try:
-                missing, slashed = await asyncio.to_thread(push_day_to_sheet, date_str, minutes)
-            except Exception as e:
-                logging.exception("Sheet push failed for %s", date_str)
-                parts.append(f"**{date_str}**: eroare la scrierea în sheet: {e}")
-                ok = False
+        parts = []
+        results = await services.push_days_to_sheet(interaction.user, interaction.guild, dates)
+        for r in results:
+            if "error" in r:
+                parts.append(f"**{r['date']}**: eroare la scrierea în sheet: {r['error']}")
                 continue
-            mark_sheet_export(date_str, interaction.user.id, int(local_now().timestamp()))
-            written = len(minutes) - len(missing)
-            desc = f"**{date_str}** (coloana {sheet_day_column(date_str)}): {written} pontaje scrise, restul membrilor din sheet au primit 0."
-            if slashed:
-                desc += f"\nAngajați în această zi, sub {DAILY_TARGET_MINUTES} min (\"/\"): " + ", ".join(slashed)
-            if missing:
-                desc += "\nCallsign negăsit în sheet: " + ", ".join(missing)
-            if no_callsign:
-                desc += "\nFără callsign în nume: " + ", ".join(no_callsign)
+            desc = f"**{r['date']}** (coloana {r['column']}): {r['rows_written']} pontaje scrise, restul membrilor din sheet au primit 0."
+            if r["slash"]:
+                desc += f"\nAngajați în această zi, sub {DAILY_TARGET_MINUTES} min (\"/\"): " + ", ".join(r["slash"])
+            if r["not_found"]:
+                desc += "\nCallsign negăsit în sheet: " + ", ".join(r["not_found"])
+            if r["no_callsign"]:
+                desc += "\nFără callsign în nume: " + ", ".join(r["no_callsign"])
             parts.append(desc)
-            await log_command(interaction, "day-report-sheet", extra=f"date={date_str} rows={written}")
+        ok = not any("error" in r for r in results)
         await reply(interaction, "Trimite în Sheet", "\n\n".join(parts)[:3900], discord.Color.green() if ok else discord.Color.orange())
 
     async def _everyone(self, interaction: discord.Interaction):
@@ -796,7 +773,7 @@ class OngoingStopView(OwnedView):
     PAGE_SIZE = 4
 
     def __init__(self, requester_id: int, day: str, sessions: list[tuple[int, str]], names: dict[int, str]):
-        super().__init__(requester_id)
+        super().__init__(requester_id, timeout=600)
         self.day, self.sessions, self.names, self.page = day, sessions, names, 0
         self.pending: tuple[int, str] | None = None
         self.note = ""
@@ -852,14 +829,13 @@ class OngoingStopView(OwnedView):
             return await interaction.response.defer()
         uid, ci = self.pending
         self.pending = None
-        remove_session(uid, self.day, ci)
         self.sessions = [s for s in self.sessions if s != (uid, ci)]
         self.page = min(self.page, self.total_pages() - 1)
         self.note = f"Sesiune oprită: <@{uid}> ({ci})."
-        await self._redraw(interaction)
-        await dm(uid, f"Sesiunea ta ({ci} - {self.day}) a fost oprită de {interaction.user.display_name}.")
-        target = (await fetch_members(interaction.guild, [uid]) or [None])[0]
-        await log_command(interaction, "ongoing-stop-button", target=target, changed=True, extra=f"uid={uid} start={ci}")
+        await interaction.response.defer()  # the DM and log below can take longer than Discord's 3 s
+        await services.stop_session(interaction.user, interaction.guild, uid, self.day, ci)
+        self.rebuild()
+        await interaction.edit_original_response(embed=self.embed(interaction.user), view=self)
 
 # --------------- HR: warns ---------------
 async def _open_warn_actions(interaction: discord.Interaction, member: discord.Member):
@@ -897,19 +873,14 @@ class WarnReasonModal(discord.ui.Modal, title="Motiv Warn"):
             return await interaction.response.send_message("Permisiune refuzată.", ephemeral=True)
         if get_punish_count(self.target.id) >= 3:
             return await reply(interaction, "Limită", f"{self.target.mention} are deja 3/3. Reset necesar.", discord.Color.orange())
-        new_count = increment_punish_count(self.target.id)
+        await interaction.response.defer()
+        new_count = await services.add_warn(interaction.user, interaction.guild, self.target, self.reason.value)
+        if new_count is None:  # reached 3/3 in the meantime
+            return await reply(interaction, "Limită", f"{self.target.mention} are deja 3/3. Reset necesar.", discord.Color.orange())
         # Close the warn panel so a second click can't warn twice
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             embed=make_embed("Warn trimis", f"{self.target.mention} -> {new_count}/3", discord.Color.green(), interaction.user), view=None,
         )
-        await _post_warn(
-            interaction, self.target, "Avertisment",
-            f"Avertizat de {interaction.user.mention}\nWarn {new_count}/3\n\n{self.reason.value}",
-            discord.Color.red() if new_count == 3 else discord.Color.orange(),
-            ping_mgmt=new_count == 3,
-        )
-        await dm(self.target.id, f"Ai primit un warn ({new_count}/3) de la {interaction.user.display_name}: {self.reason.value}")
-        await log_command(interaction, "warn-add-ui", target=self.target, changed=True, extra=f"new_count={new_count}")
 
 class WarnResetModal(discord.ui.Modal, title="Reset Warn-uri"):
     note = discord.ui.TextInput(label="Notă (opțional)", style=discord.TextStyle.paragraph, required=False, max_length=300)
@@ -921,16 +892,11 @@ class WarnResetModal(discord.ui.Modal, title="Reset Warn-uri"):
     async def on_submit(self, interaction: discord.Interaction):
         if not has_role(interaction.user, CONDUCERE_ROLE_ID):
             return await interaction.response.send_message("Doar Conducere poate reseta.", ephemeral=True)
-        reset_punish_count(self.target.id)
-        await interaction.response.edit_message(
+        await interaction.response.defer()
+        await services.reset_warns(interaction.user, interaction.guild, self.target, self.note.value)
+        await interaction.edit_original_response(
             embed=make_embed("Reset", f"{self.target.mention} resetat la 0/3.", discord.Color.green(), interaction.user), view=None,
         )
-        await _post_warn(
-            interaction, self.target, "Reset Warn-uri",
-            f"Resetat de {interaction.user.mention}.\n{self.note.value.strip()}", discord.Color.green(),
-        )
-        await dm(self.target.id, f"Warn-urile tale au fost resetate de {interaction.user.display_name}.")
-        await log_command(interaction, "warn-reset-ui", target=self.target, changed=True)
 
 # --------------- HR: add minutes ---------------
 async def _open_add_minutes(interaction: discord.Interaction, member: discord.Member):
@@ -960,21 +926,9 @@ class AddMinutesModal(discord.ui.Modal, title="Adaugă Minute"):
         if not 0 < minutes_val <= 1440:  # also rejects nan/inf
             return await reply(interaction, "Minute invalide", "Trebuie să fie între 1 și 1440.")
 
-        # Start at the first free second from 00:00:00 so it never collides with an existing clock_in
-        occupied = {ci for ci, _ in get_clock_times(self.target.id, date_str)}
-        start = parse_local(date_str, "00:00:00")
-        while start.strftime("%H:%M:%S") in occupied:
-            start += datetime.timedelta(seconds=1)
-        end = start + datetime.timedelta(minutes=minutes_val)
-        if end.date() != start.date():
-            end = start.replace(hour=23, minute=59, second=59)
-        ci, co = start.strftime("%H:%M:%S"), end.strftime("%H:%M:%S")
-
-        add_clock_in(self.target.id, date_str, ci)
-        update_clock_out(self.target.id, date_str, co, ci)
+        await interaction.response.defer(ephemeral=True)
+        ci, co = await services.add_minutes(interaction.user, self.target, date_str, minutes_val)
         await reply(interaction, "Minute adăugate", f"{self.target.mention} | Sesiune nouă {ci} -> {co} ({minutes_val:.0f}m)", discord.Color.green())
-        await log_command(interaction, "adaugaminute-button", target=self.target, changed=True, extra=f"date={date_str} minutes={minutes_val}")
-        await dm(self.target.id, f"{minutes_val:.0f} minute adaugate prin sesiunea {ci} -> {co}  de {interaction.user.display_name}.")
 
 # --------------- HR: delete a session ---------------
 def recent_sessions(uid: int, days: int = 7) -> list[tuple[str, str, str | None]]:
@@ -1060,13 +1014,12 @@ class RemovePontajView(OwnedView):
                 view=None,
             )
         co = current[ci]
-        remove_session(self.target.id, d, ci)
-        await interaction.response.edit_message(
+        await interaction.response.defer()
+        await services.delete_session(interaction.user, self.target, d, ci, co)
+        await interaction.edit_original_response(
             embed=make_embed("Pontaj șters", f"{self.target.mention} | {d}\n{ci} - {co or '...'}", discord.Color.green(), interaction.user),
             view=None,
         )
-        await log_command(interaction, "stergepontaj", target=self.target, changed=True, extra=f"date={d} start={ci} end={co}")
-        await dm(self.target.id, f"Sesiunea ({ci} - {co or '...'} / {d}) a fost ștearsă de {interaction.user.display_name}.")
 
 class RemovePontajDateModal(discord.ui.Modal, title="Dată Pontaj"):
     def __init__(self, target: discord.Member):
@@ -1235,12 +1188,12 @@ class Bot(commands.Bot):
 
         self.auto_close_today_sessions.start()
         self.sync_concedii.start()
+        self.update_sheet_names.start()
 
-        if PONTAJE_API_TOKEN:
-            try:
-                await _start_pontaje_api()
-            except Exception:
-                logging.exception("Failed to start Pontaje API server")
+        try:
+            await start_http_api()
+        except Exception:
+            logging.exception("Failed to start the HTTP API server")
 
     @tasks.loop(minutes=30)
     async def sync_concedii(self):
@@ -1250,6 +1203,14 @@ class Bot(commands.Bot):
                 logging.info("Concedii sync: %d CO cells written", changed)
         except Exception:
             logging.exception("Concedii sync failed")
+
+    @tasks.loop(time=datetime.time(0, 0, tzinfo=ZoneInfo(TIMEZONE)))
+    async def update_sheet_names(self):
+        try:
+            rows = await asyncio.to_thread(update_pontaje_names)
+            logging.info("Pontaje names update: %d rows changed", rows)
+        except Exception:
+            logging.exception("Pontaje names update failed")
 
     @tasks.loop(minutes=1)
     async def auto_close_today_sessions(self):
@@ -1391,6 +1352,20 @@ async def clockpanel_cmd(interaction: discord.Interaction):
 async def hrpanel_cmd(interaction: discord.Interaction):
     await _post_panel(interaction, "HR Panel", "Folosește butoanele pentru a interactiona cu panoul HR.", HrButtons(), "hrpanel")
 
+@bot.tree.command(name="hrdashboard", description="Postează panoul HR Dashboard")
+@in_channel_check(ALLOWED_CHANNEL_ID)
+@hr_or_conducere_check()
+async def hrdashboard_cmd(interaction: discord.Interaction):
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Deschide HR Dashboard", url="https://hrdashboard-phoenix.vercel.app/"))
+    await _post_panel(
+        interaction,
+        "HR Dashboard",
+        "Toate atribuțiile de HR se gestionează din **HR Dashboard**.\nApasă butonul de mai jos pentru a-l deschide.",
+        view,
+        "hrdashboard",
+    )
+
 # --------------- Owner DB commands ("@bot dbv" / "@bot dbs") ---------------
 @bot.command(name="dbv", aliases=["dbvacumm"], help="Checkpoint WAL + VACUUM (owner only)")
 async def dbvacuum_prefix(ctx: commands.Context):
@@ -1444,14 +1419,20 @@ async def _handle_pontaje_request(request: aiohttp_web.Request) -> aiohttp_web.R
 async def _handle_health(request: aiohttp_web.Request) -> aiohttp_web.Response:
     return aiohttp_web.json_response({"status": "ok"})
 
-async def _start_pontaje_api():
-    app = aiohttp_web.Application()
-    app.router.add_get("/api/pontaje", _handle_pontaje_request)
-    app.router.add_get("/health", _handle_health)
+async def start_http_api():
+    """/api/pontaje (when PONTAJE_API_TOKEN is set) and the web app's /api/web/rpc (when WEB_API_KEY is set), on one port."""
+    import web_api  # reads this module's config at import, so only once it is fully loaded
+    app = aiohttp_web.Application(client_max_size=64 * 1024)
+    if PONTAJE_API_TOKEN:
+        app.router.add_get("/api/pontaje", _handle_pontaje_request)
+        app.router.add_get("/health", _handle_health)
+    web = web_api.add_routes(app)
+    if not PONTAJE_API_TOKEN and not web:
+        return
     runner = aiohttp_web.AppRunner(app, access_log=None)  # the port is public; scanner 404s flooded the console
     await runner.setup()
-    await aiohttp_web.TCPSite(runner, "0.0.0.0", PONTAJE_API_PORT).start()
-    logging.info(f"Pontaje API listening on 0.0.0.0:{PONTAJE_API_PORT}")
+    await aiohttp_web.TCPSite(runner, web_api.WEB_API_HOST, web_api.WEB_API_PORT).start()
+    logging.info("HTTP API listening on %s:%s (pontaje=%s, web=%s)", web_api.WEB_API_HOST, web_api.WEB_API_PORT, bool(PONTAJE_API_TOKEN), web)
 
 # --------------- Run ---------------
 if __name__ == "__main__":

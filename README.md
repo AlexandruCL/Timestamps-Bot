@@ -64,12 +64,21 @@ Authorization: Bearer <PONTAJE_API_TOKEN>
 
 An open session has `"ongoing": true` and counts up to now. `GET /health` returns `{"status": "ok"}`.
 
+### HR Dashboard web API
+
+When `WEB_API_KEY` is set, the bot also serves `POST /api/web/rpc` on the same port for the HR Dashboard web app. Every request and response is sealed with AES-256-GCM using a shared key, and requests carry a timestamp and a request id so old or repeated ones are rejected. `WEB_API_KEY_OLD` keeps a previous key valid while you rotate it. Requests are rate-limited per IP.
+
+The dashboard can do everything the HR panel does: view open sessions and stop them, read day reports, add minutes, delete sessions, add or reset warns, send days to the pontaje sheet and browse the action log. Access is checked against the caller's Discord roles (HR or Conducere).
+
+The bot also refreshes member names in the pontaje sheet every night at 00:00, and the dashboard can trigger the same refresh on demand.
+
 ### Commands
 
 | Command | Who | What |
 |---|---|---|
 | `/clockpanel` | Owner, in the panel channel | Posts the clock panel |
 | `/hrpanel` | Owner, in the panel channel | Posts the HR panel |
+| `/hrdashboard` | HR or Conducere, in the panel channel | Posts a button that opens the HR Dashboard |
 | `@bot dbv` | Owner | WAL checkpoint and `VACUUM` on the database |
 | `@bot dbs` | Owner | Database size and free space |
 
@@ -80,7 +89,7 @@ The panels are persistent: their buttons keep working after a restart.
 Requires Python 3.10+ and SQLite 3.24+.
 
 ```bash
-pip install discord.py python-dotenv gspread
+pip install discord.py python-dotenv gspread aiohttp cryptography
 ```
 
 Create a `.env` file:
@@ -104,6 +113,14 @@ PONTAJE_SHEET_ID=
 PD_SPREADSHEET_ID=
 PONTAJE_API_TOKEN=             # API is off when empty
 PONTAJE_API_PORT=3080
+WEB_API_KEY=                   # 32 bytes, base64; the web API is off when empty
+WEB_API_KEY_OLD=               # previous key, accepted during rotation
+WEB_API_HOST=0.0.0.0
+WEB_API_PORT=                  # defaults to PONTAJE_API_PORT
+WEB_HR_ROLE_IDS=               # defaults to the HR role
+WEB_CONDUCERE_ROLE_IDS=        # defaults to CONDUCERE_ROLE_ID
+SHEET_CACHE_TTL_SECONDS=300
+ROLE_CACHE_TTL_SECONDS=300
 DEV_GUILD_ID=                  # sync slash commands to one guild only
 EOD_CONFIRM_WINDOW_SECS=300
 WEEKLY_TARGET_MINUTES=700
@@ -124,7 +141,12 @@ python pontaje.py
 ## Files
 
 ```
-pontaje.py    the bot: panels, views, scheduled tasks, Sheets export, HTTP API
+pontaje.py    the bot: panels, views, scheduled tasks, HTTP API
+services.py   HR actions shared by the Discord panels and the web API
+sheets.py     Google Sheets reads and writes
+metrics.py    calculations behind the dashboard pages
+web_api.py    encrypted RPC endpoint for the HR Dashboard
+envelope.py   AES-256-GCM request/response sealing and replay checks
 database.py   SQLite access (clock_times.db, punishments.db)
 ```
 
@@ -134,6 +156,7 @@ database.py   SQLite access (clock_times.db, punishments.db)
 
 - `clock_times(user_id, date, clock_in, clock_out)`: one row per session, `clock_out` is NULL while open.
 - `sheet_exports(date, user_id, sent_at)`: last time each day was sent to the sheet.
+- `logs`: the action log shown in the dashboard.
 
 `punishments.db`:
 
