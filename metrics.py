@@ -140,7 +140,7 @@ def dashboard(member_rows, grid: list[dict], *, today: str, week: list[str], min
         counts = [_active_counts(ms, d, minutes, leave) for d in elapsed]
         grade_activity.append({"grade": g, "pct": _pct(sum(a for a, _ in counts), sum(e for _, e in counts))})
 
-    ranked = sorted((r for r in grid if r["total"]), key=lambda r: -r["total"])[:5]
+    ranked = sorted((r for r in grid if r["total"]), key=lambda r: -r["total"])[:10]
     return {
         "conducere": {"count": len(conducere), "by_grade": count_by(conducere)},
         "efectiv": {"total": len(members), "on_leave": sum(m["status"] == "CONCEDIU" for m in members)},
